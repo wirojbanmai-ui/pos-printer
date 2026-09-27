@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#e8590c">
+<title>สถานีพิมพ์ POS</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@400;700;800&display=swap" rel="stylesheet">
+<!--
+  สถานีพิมพ์ POS — เปิดระบบ POS (Google Apps Script) ไว้ข้างใน แล้วพิมพ์สลิปผ่าน USB / Bluetooth ได้โดยตรง
+  เหตุผล: หน้า POS อยู่ในกรอบของ Google ซึ่งไม่อนุญาตให้ใช้ USB/Bluetooth
+          หน้านี้เป็นหน้าหลักของเบราว์เซอร์ จึงเชื่อมต่อเครื่องพิมพ์ได้ แล้วรับงานพิมพ์จาก POS ผ่าน postMessage
+  วิธีติดตั้ง: ดู README.md หัวข้อ "สถานีพิมพ์"
+-->
+<style>
+  :root{--pri:#e8590c;--ink:#2b2118;--mut:#8a7a6a;--line:#f0e2cf;--ok:#2f9e44;--red:#e03131;--bg:#fff8ef}
+  *{box-sizing:border-box}
+  [hidden]{display:none!important}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family:'Sarabun',system-ui,sans-serif;font-size:16px}
+  #pos{position:fixed;inset:0;width:100%;height:100%;border:0;background:var(--bg)}
+  #fab{position:fixed;left:10px;bottom:calc(10px + env(safe-area-inset-bottom,0px));z-index:20;border:0;border-radius:999px;padding:8px 14px;font:inherit;font-weight:800;font-size:14px;color:#fff;background:var(--ink);box-shadow:0 4px 14px rgba(0,0,0,.25);cursor:pointer;opacity:.92}
+  #fab.ok{background:var(--ok)}#fab.bad{background:var(--red)}
+  .back{position:fixed;inset:0;background:rgba(30,20,10,.5);z-index:30;display:flex;align-items:center;justify-content:center;padding:16px}
+  .box{background:#fff;border-radius:20px;padding:20px;width:100%;max-width:460px;max-height:92vh;overflow:auto;box-shadow:0 10px 40px rgba(0,0,0,.3)}
+  .box h2{margin:0 0 6px;font-size:22px}
+  .hint{color:var(--mut);font-size:14px;line-height:1.5}
+  .btn{display:flex;align-items:center;justify-content:center;gap:6px;width:100%;min-height:48px;border-radius:14px;border:1px solid var(--line);background:#fff;font:inherit;font-weight:800;font-size:16px;cursor:pointer;margin-top:8px;color:var(--ink)}
+  .btn.pri{background:var(--pri);border-color:var(--pri);color:#fff}
+  .opt{display:flex;gap:10px;align-items:flex-start;width:100%;text-align:left;border:2px solid var(--line);background:#fff;border-radius:14px;padding:10px 12px;margin-top:8px;font:inherit;cursor:pointer}
+  .opt.on{border-color:var(--pri);background:#fff4e6}
+  .opt b{display:block}
+  .seg{display:flex;gap:6px;margin-top:8px}.seg .opt{margin-top:0;justify-content:center;font-weight:800}
+  input.in{width:100%;border:1px solid var(--line);border-radius:12px;padding:12px;font:inherit;margin-top:8px}
+  .stat{margin-top:12px;padding:10px 12px;border-radius:12px;background:#f8f9fa;font-weight:700}
+  .log{margin-top:10px;font-size:13px;color:var(--mut);max-height:140px;overflow:auto;background:#fafafa;border-radius:10px;padding:8px;line-height:1.6}
+  #toast{position:fixed;left:50%;top:14px;transform:translateX(-50%);z-index:40;display:grid;gap:6px;pointer-events:none;width:calc(100% - 32px);max-width:420px}
+  .tst{background:var(--ink);color:#fff;border-radius:12px;padding:10px 14px;font-weight:700;box-shadow:0 4px 14px rgba(0,0,0,.25)}
+  .tst.ok{background:var(--ok)}.tst.err{background:var(--red)}
+  #setup{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:16px}
+</style>
+</head>
+<body>
+<iframe id="pos" title="POS" allow="usb; bluetooth; autoplay; screen-wake-lock; camera; clipboard-write; fullscreen" hidden></iframe>
+
+<div id="setup" hidden>
+  <div class="box">
+    <h2>🖨️ สถานีพิมพ์ POS</h2>
+    <div class="hint">วางลิงก์ระบบ POS ของร้าน (Web App URL ที่ลงท้ายด้วย <b>/exec</b>) ทำครั้งเดียว ระบบจะจำไว้</div>
+    <div id="envWarn"></div>
+    <input class="in" id="urlIn" placeholder="https://script.google.com/macros/s/.../exec" autocomplete="off">
+    <button class="btn pri" onclick="saveUrl()">เปิดระบบ POS</button>
+  </div>
+</div>
+
+<button id="fab" onclick="openPanel()" hidden>🖨️</button>
+<div id="panel"></div>
+<div id="toast"></div>
+
+<script>
+/* ---------------- ตัวช่วยทั่วไป ---------------- */
+function $(s){return document.querySelector(s);}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]});}
+function toast(m,type){var d=document.createElement('div');d.className='tst '+(type||'');d.textContent=m;$('#toast').appendChild(d);setTimeout(function(){d.remove()},type==='err'?5000:2500);}
+function store(k,v){try{if(v===undefined)return localStorage.getItem(k);localStorage.setItem(k,v);}catch(e){return null;}}
+
+/* ---------------- ระบบพิมพ์ (ESC/POS ผ่าน USB / Bluetooth) ---------------- */
+var H2C_URL='https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';
+var PRN=(function(){try{return JSON.parse(localStorage.getItem('pos_printer')||'{}')}catch(e){return {}}})(); // {method:'browser'|'usb'|'bt', paper:'58'|'80'}
+function savePrn(){try{localStorage.setItem('pos_printer',JSON.stringify(PRN))}catch(e){}}
+var DP={dev:null,type:'',ep:0,ch:null,svc:'',chr:'',name:'',chunk:180};
+var BT_SERVICES=['000018f0-0000-1000-8000-00805f9b34fb','e7810a71-73ae-499d-8c15-faa9aef0c3f2','49535343-fe7d-4ae5-8fa9-9fafd205e455',
+  '0000ff00-0000-1000-8000-00805f9b34fb','0000fee7-0000-1000-8000-00805f9b34fb','0000ae30-0000-1000-8000-00805f9b34fb','0000ffe0-0000-1000-8000-00805f9b34fb','0000ff10-0000-1000-8000-00805f9b34fb'];
+function dpSupport(){
+  var pol=document.permissionsPolicy||document.featurePolicy;
+  var allow=function(f){ try{ return !pol||pol.allowsFeature(f); }catch(e){ return true; } };
+  var r={usbApi:!!navigator.usb,btApi:!!navigator.bluetooth,usbPol:allow('usb'),btPol:allow('bluetooth')};
+  r.usb=r.usbApi&&r.usbPol; r.bt=r.btApi&&r.btPol; return r;
+}
+function loadScript(src){return new Promise(function(res,rej){ if(document.querySelector('script[data-src="'+src+'"]')&&window.html2canvas) return res();
+  var s=document.createElement('script'); s.src=src; s.setAttribute('data-src',src); s.onload=res; s.onerror=function(){rej(new Error('LOAD_FAILED'))}; document.head.appendChild(s); });}
+function dpSleep(ms){return new Promise(function(r){setTimeout(r,ms)});}
+
+/* ---- USB ---- */
+async function dpUsbOpen(d){
+  await d.open();
+  if(d.configuration===null) await d.selectConfiguration(1);
+  var found=null;
+  d.configuration.interfaces.forEach(function(itf){ itf.alternates.forEach(function(alt){
+    var ep=alt.endpoints.filter(function(e){return e.direction==='out'&&e.type==='bulk'})[0];
+    if(ep&&(!found||alt.interfaceClass===7)) found={itf:itf.interfaceNumber,ep:ep.endpointNumber}; // 7 = คลาสเครื่องพิมพ์
+  }); });
+  if(!found) throw new Error('NO_ENDPOINT');
+  try{ await d.claimInterface(found.itf); }catch(e){ throw new Error('CLAIM_FAILED'); }
+  DP={dev:d,type:'usb',ep:found.ep,name:d.productName||'USB Printer',chunk:16384};
+  return DP.name;
+}
+async function dpUsbConnect(){ if(!navigator.usb) throw new Error('NO_USB'); var d=await navigator.usb.requestDevice({filters:[]}); return dpUsbOpen(d); }
+async function dpUsbAuto(){ if(!navigator.usb) return ''; var l=await navigator.usb.getDevices(); if(!l.length) return ''; return dpUsbOpen(l[0]); }
+
+/* ---- Bluetooth (BLE) ---- */
+async function dpBtFindChar(server){
+  var svcs=await server.getPrimaryServices();
+  for(var i=0;i<svcs.length;i++){
+    var chs; try{ chs=await svcs[i].getCharacteristics(); }catch(e){ continue; }
+    for(var j=0;j<chs.length;j++){ var p=chs[j].properties; if(p.writeWithoutResponse||p.write) return chs[j]; }
+  }
+  throw new Error('NO_ENDPOINT');
+}
+async function dpBtConnect(){
+  if(!navigator.bluetooth) throw new Error('NO_BT');
+  var d=await navigator.bluetooth.requestDevice({acceptAllDevices:true,optionalServices:BT_SERVICES});
+  var server=await d.gatt.connect(); var ch=await dpBtFindChar(server);
+  DP={dev:d,type:'bt',ch:ch,name:d.name||'Bluetooth Printer',chunk:180};
+  return DP.name;
+}
+async function dpBtEnsure(){ if(DP.type==='bt'&&DP.dev&&!DP.dev.gatt.connected){ var s=await DP.dev.gatt.connect(); DP.ch=await dpBtFindChar(s); } }
+
+/* ---- ส่งข้อมูล ---- */
+async function dpWrite(bytes){
+  if(DP.type==='usb'){
+    for(var i=0;i<bytes.length;i+=DP.chunk){ var r=await DP.dev.transferOut(DP.ep,bytes.subarray(i,i+DP.chunk)); if(r&&r.status&&r.status!=='ok') throw new Error('USB_'+r.status); }
+    return;
+  }
+  if(DP.type==='bt'){
+    await dpBtEnsure();
+    var ch=DP.ch, noResp=ch.properties.writeWithoutResponse&&ch.writeValueWithoutResponse, n=0;
+    for(var k=0;k<bytes.length;){
+      var part=bytes.subarray(k,k+DP.chunk);
+      try{ if(noResp) await ch.writeValueWithoutResponse(part); else await ch.writeValue(part); k+=part.length; n++; if(noResp&&n%32===0) await dpSleep(15); }
+      catch(e){ if(DP.chunk>20){ DP.chunk=20; continue; } throw e; } // เครื่องรับข้อมูลทีละน้อย → ลดขนาดแล้วลองใหม่
+    }
+    return;
+  }
+  throw new Error('NOT_CONNECTED');
+}
+
+/* ---- สลิป HTML → ภาพขาวดำ → คำสั่ง ESC/POS ---- */
+function paperDots(p){ return String(p)==='58'?384:576; }           // 203 dpi: 58มม.=384 จุด, 80มม.=576 จุด
+function paperCss(p){ return String(p)==='58'?181:272; }            // ความกว้างพิมพ์ได้จริง 48/72 มม. เป็น CSS px
+/* จำกัด CSS ของสลิปให้มีผลเฉพาะในกล่องสำหรับแปลงเป็นภาพ */
+function scopeSlipCss(css){
+  return css.replace(/@page\s*\{[^}]*\}/g,'').split('}').map(function(rule){
+    var i=rule.indexOf('{'); if(i<0) return rule;
+    var sel=rule.slice(0,i).trim(); if(!sel) return '';
+    return sel.split(',').map(function(x){ x=x.trim(); return x==='body'?'#dpBox':x==='*'?'#dpBox *':'#dpBox '+x; }).join(',')+rule.slice(i);
+  }).join('}');
+}
+async function slipToCanvas(docHtml,paper){
+  if(!window.html2canvas) await loadScript(H2C_URL);
+  var cssW=paperCss(paper);
+  var css=(docHtml.match(/<style>([\s\S]*?)<\/style>/)||[])[1]||'', body=(docHtml.match(/<body>([\s\S]*)<\/body>/)||[])[1]||docHtml;
+  var st=document.createElement('style'); st.textContent=scopeSlipCss(css)+'#dpBox{width:'+cssW+'px!important;padding:0 1px 2px!important;margin:0!important;background:#fff;color:#000}';
+  var box=document.createElement('div'); box.id='dpBox'; box.style.cssText='position:absolute;left:-10000px;top:0;';
+  box.innerHTML=body; document.head.appendChild(st); document.body.appendChild(box);
+  try{
+    var imgs=[].slice.call(box.querySelectorAll('img')); await Promise.all(imgs.map(function(im){return im.complete?0:new Promise(function(r){im.onload=im.onerror=r;})}));
+    if(document.fonts&&document.fonts.ready) try{ await document.fonts.ready; }catch(e){}
+    return await window.html2canvas(box,{backgroundColor:'#ffffff',scale:paperDots(paper)/cssW,logging:false,
+      onclone:function(d){ var c=d.getElementById('dpBox'); if(c){ c.style.left='0px'; } }});
+  } finally { box.remove(); st.remove(); }
+}
+function canvasToEscPos(src,dots){
+  var W=dots, H=Math.round(src.height*dots/src.width);
+  var cv=document.createElement('canvas'); cv.width=W; cv.height=H;
+  var x=cv.getContext('2d'); x.fillStyle='#fff'; x.fillRect(0,0,W,H); x.drawImage(src,0,0,W,H);
+  var px=x.getImageData(0,0,W,H).data, bw=Math.ceil(W/8), bits=new Uint8Array(bw*H), last=0;
+  for(var y=0;y<H;y++){ for(var xx=0;xx<W;xx++){ var i=(y*W+xx)*4; if(px[i]*0.299+px[i+1]*0.587+px[i+2]*0.114<150){ bits[y*bw+(xx>>3)]|=(0x80>>(xx&7)); last=y; } } }
+  H=Math.min(H,last+8);                                           // ตัดกระดาษว่างท้ายสลิป
+  var out=[0x1B,0x40];                                            // ESC @ เริ่มต้นเครื่อง
+  for(var y0=0;y0<H;y0+=200){
+    var hh=Math.min(200,H-y0);
+    out.push(0x1D,0x76,0x30,0x00,bw&255,bw>>8,hh&255,hh>>8);      // GS v 0 พิมพ์ภาพ
+    for(var r=0;r<hh;r++){ var off=(y0+r)*bw; for(var c=0;c<bw;c++) out.push(bits[off+c]); }
+  }
+  out.push(0x1B,0x64,0x04,0x1D,0x56,0x42,0x00);                   // เลื่อนกระดาษ + ตัด
+  return new Uint8Array(out);
+}
+PRN.method=PRN.method||'usb'; PRN.paper=PRN.paper||'80';
+var LOG=[], LAST_ERR='';
+function log(m){ var d=new Date(); LOG.unshift(('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)+':'+('0'+d.getSeconds()).slice(-2)+'  '+m); LOG=LOG.slice(0,30); if($('#logBox')) $('#logBox').innerHTML=LOG.map(esc).join('<br>'); }
+function errText(e){
+  var m=(e&&(e.message||e.name))||String(e);
+  if(/NO_USB/.test(m)) return 'เบราว์เซอร์นี้ไม่รองรับ USB (ใช้ Google Chrome)';
+  if(/NO_BT/.test(m)) return 'เบราว์เซอร์นี้ไม่รองรับ Bluetooth (ใช้ Google Chrome และเปิด Bluetooth + ตำแหน่ง)';
+  if(/NotFoundError|cancel|No device selected/i.test(m)) return 'ยังไม่ได้เลือกเครื่องพิมพ์';
+  if(/CLAIM_FAILED/.test(m)) return 'เครื่องพิมพ์ถูกแอปอื่นใช้อยู่ ถอดสาย USB แล้วเสียบใหม่';
+  if(/NO_ENDPOINT/.test(m)) return 'อุปกรณ์นี้ไม่ใช่เครื่องพิมพ์ หรือไม่รองรับการส่งข้อมูล';
+  if(/NOT_CONNECTED/.test(m)) return 'ยังไม่ได้เชื่อมต่อเครื่องพิมพ์';
+  if(/LOAD_FAILED/.test(m)) return 'โหลดตัวแปลงสลิปไม่ได้ ตรวจอินเทอร์เน็ต';
+  if(/permissions policy|disallowed/i.test(m)) return 'หน้านี้ถูกเปิดอยู่ในกรอบของเว็บอื่น (เช่น ช่องแสดงตัวอย่างไฟล์) จึงใช้อุปกรณ์ไม่ได้ ต้องนำไฟล์ขึ้น GitHub Pages แล้วเปิดลิงก์ตรงๆ ใน Chrome';
+  if(/SecurityError|user gesture|activation/i.test(m)) return 'ต้องแตะปุ่ม "เชื่อมต่อ" บนหน้าจอนี้โดยตรง';
+  return m;
+}
+function status(){ return {type:'pos-printer-status',method:PRN.method,paper:PRN.paper,connected:!!DP.dev,name:DP.name||'',error:LAST_ERR}; }
+async function connect(){
+  LAST_ERR='';
+  try{ var n=PRN.method==='bt'?await dpBtConnect():await dpUsbConnect(); log('เชื่อมต่อ '+n); toast('✅ เชื่อมต่อแล้ว: '+n,'ok'); }
+  catch(e){ LAST_ERR=errText(e); log('เชื่อมต่อไม่สำเร็จ: '+LAST_ERR); toast(LAST_ERR,'err'); }
+  renderFab(); if($('#panel').innerHTML) openPanel(); notifyPos();
+}
+async function autoConnect(){
+  if(PRN.method==='usb'&&!DP.dev){ try{ var n=await dpUsbAuto(); if(n){ log('เชื่อมต่อ USB อัตโนมัติ: '+n); } }catch(e){ LAST_ERR=errText(e); } }
+  renderFab(); notifyPos();
+}
+/* พิมพ์ทีละงานตามลำดับ */
+var QUEUE=Promise.resolve();
+function printJob(html,paper){
+  QUEUE=QUEUE.then(async function(){
+    if(!DP.dev){ if(PRN.method==='usb') await autoConnect(); }
+    if(!DP.dev) throw new Error('NOT_CONNECTED');
+    var p=PRN.paper||paper||'80';
+    var cv=await slipToCanvas(html,p);
+    await dpWrite(canvasToEscPos(cv,paperDots(p)));
+  });
+  var job=QUEUE; QUEUE=QUEUE.catch(function(){}); return job;
+}
+function testSlip(){
+  return '<!doctype html><html><head><meta charset="utf-8"><style>body{margin:0;padding:2mm;font-family:Tahoma,Sarabun,sans-serif;color:#000}.t{font-size:22px;font-weight:900;text-align:center;border:3px solid #000;padding:4px}.b{font-size:44px;font-weight:900;text-align:center}.r{font-size:26px;font-weight:700;margin-top:8px}.s{font-size:14px;text-align:center;margin-top:8px}</style></head><body>'+
+    '<div class="t">ทดสอบสถานีพิมพ์</div><div class="b">พิมพ์ได้ ✓</div><div class="r">2× ผัดกะเพราหมูสับไข่ดาว</div><div class="r">1× ต้มยำกุ้ง</div><div class="s">English 123 · 日本語 · 中文 · '+new Date().toLocaleString('th-TH')+'</div></body></html>';
+}
+async function testPrint(){
+  try{ await printJob(testSlip(),PRN.paper); log('ทดสอบพิมพ์สำเร็จ'); toast('🖨️ ส่งพิมพ์แล้ว','ok'); }
+  catch(e){ LAST_ERR=errText(e); log('ทดสอบพิมพ์ไม่สำเร็จ: '+LAST_ERR); toast(LAST_ERR,'err'); }
+  renderFab();
+}
+
+/* ---------------- รับงานจากหน้า POS (postMessage) ---------------- */
+var POS_WIN=null, POS_ORIGIN='*';
+var ALLOW_ANY=/[?&]anyorigin=1/.test(location.search);
+function trusted(o){ return ALLOW_ANY||/\.googleusercontent\.com$|^https:\/\/script\.google\.com$/.test(o); }
+function reply(src,origin,msg){ try{ src.postMessage(msg,origin==='null'?'*':origin); }catch(e){} }
+function notifyPos(){ if(POS_WIN) reply(POS_WIN,POS_ORIGIN,status()); }
+window.addEventListener('message',async function(ev){
+  var d=ev.data; if(!d||typeof d!=='object'||!d.type||String(d.type).indexOf('pos-')!==0) return;
+  if(!trusted(ev.origin)) return;
+  POS_WIN=ev.source; POS_ORIGIN=ev.origin;
+  if(d.type==='pos-hello'){ reply(ev.source,ev.origin,Object.assign(status(),{type:'pos-printer-ready'})); }
+  else if(d.type==='pos-printer-config'){ if(d.method) PRN.method=d.method==='bt'?'bt':'usb'; if(d.paper) PRN.paper=String(d.paper)==='58'?'58':'80'; savePrn(); if(d.method&&DP.type&&DP.type!==PRN.method) DP={dev:null}; renderFab(); notifyPos(); }
+  else if(d.type==='pos-printer-connect'){ await connect(); }
+  else if(d.type==='pos-printer-open'){ openPanel(); }
+  else if(d.type==='pos-print'){
+    try{ await printJob(String(d.html||''),d.paper); log('พิมพ์สลิปสำเร็จ'); LAST_ERR=''; reply(ev.source,ev.origin,{type:'pos-print-result',id:d.id,ok:true}); }
+    catch(e){ LAST_ERR=errText(e); log('พิมพ์ไม่สำเร็จ: '+LAST_ERR); reply(ev.source,ev.origin,{type:'pos-print-result',id:d.id,ok:false,error:LAST_ERR}); toast('พิมพ์ไม่สำเร็จ: '+LAST_ERR,'err'); }
+    renderFab();
+  }
+});
+
+/* ---------------- หน้าจอ ---------------- */
+function renderFab(){
+  var f=$('#fab'); if(!f) return;
+  f.hidden=false; f.className=DP.dev?'ok':'bad';
+  f.textContent='🖨️ '+(PRN.method==='bt'?'Bluetooth':'USB')+(DP.dev?' ✓':' ✗');
+}
+function envWarning(){
+  var w=[];
+  var framed=false; try{ framed=window.top!==window; }catch(e){ framed=true; }
+  if(framed) w.push('หน้านี้ถูกเปิดอยู่ในกรอบของเว็บอื่น (เช่น ช่องแสดงตัวอย่างไฟล์ใน Claude) จึงเชื่อมต่อเครื่องพิมพ์ไม่ได้ ให้นำไฟล์ขึ้น GitHub Pages แล้วเปิดลิงก์นั้นตรงๆ ใน Chrome');
+  else if(!window.isSecureContext) w.push('ต้องเปิดผ่านลิงก์ https:// (เช่น GitHub Pages) จึงจะเชื่อมต่อเครื่องพิมพ์ได้');
+  if(!navigator.usb&&!navigator.bluetooth) w.push('เบราว์เซอร์นี้ไม่รองรับการต่อเครื่องพิมพ์ ให้ใช้ Google Chrome บน Android หรือคอม');
+  return w.length?'<div style="background:#fff3bf;color:#6b4d00;border:2px solid #fab005;border-radius:12px;padding:10px 12px;margin-top:10px;font-weight:700;font-size:14px;line-height:1.5">⚠️ '+w.map(esc).join('<br>⚠️ ')+'</div>':'';
+}
+function openPanel(){
+  var m=PRN.method, p=PRN.paper;
+  var sup={usb:!!navigator.usb,bt:!!navigator.bluetooth};
+  $('#panel').innerHTML='<div class="back" onclick="if(event.target===this)closePanel()"><div class="box">'+
+    '<h2>🖨️ สถานีพิมพ์</h2><div class="hint">เครื่องนี้พิมพ์สลิปจากระบบ POS ได้โดยตรง ไม่ต้องลงแอปเพิ่ม</div>'+envWarning()+
+    '<button class="opt'+(m==='usb'?' on':'')+'" onclick="setMethod(\'usb\')"><span>'+(m==='usb'?'●':'○')+'</span><span><b>🔌 USB (สาย OTG / คอม)</b><span class="hint">'+(sup.usb?'แนะนำ · เชื่อมต่อครั้งเดียว ครั้งต่อไปต่อเองอัตโนมัติ':'⚠️ เบราว์เซอร์นี้ไม่รองรับ ใช้ Google Chrome')+'</span></span></button>'+
+    '<button class="opt'+(m==='bt'?' on':'')+'" onclick="setMethod(\'bt\')"><span>'+(m==='bt'?'●':'○')+'</span><span><b>📶 Bluetooth (BLE)</b><span class="hint">'+(sup.bt?'ต้องกดเชื่อมต่อใหม่ทุกครั้งที่เปิดหน้านี้':'⚠️ เบราว์เซอร์นี้ไม่รองรับ ใช้ Google Chrome')+'</span></span></button>'+
+    '<div class="seg"><button class="opt'+(p==='58'?' on':'')+'" onclick="setPaper(\'58\')">58 mm</button><button class="opt'+(p!=='58'?' on':'')+'" onclick="setPaper(\'80\')">80 mm</button></div>'+
+    '<div class="stat">'+(DP.dev?'✅ เชื่อมต่อแล้ว: '+esc(DP.name):'⚠️ ยังไม่ได้เชื่อมต่อ')+(LAST_ERR?'<div style="color:var(--red);font-size:14px;margin-top:4px">'+esc(LAST_ERR)+'</div>':'')+'</div>'+
+    '<button class="btn pri" onclick="connect()">🔗 เชื่อมต่อเครื่องพิมพ์</button>'+
+    '<button class="btn" onclick="testPrint()">🧪 ทดสอบพิมพ์</button>'+
+    '<div class="log" id="logBox">'+(LOG.map(esc).join('<br>')||'ยังไม่มีประวัติการพิมพ์')+'</div>'+
+    '<button class="btn" onclick="changeUrl()">🔗 เปลี่ยนลิงก์ระบบ POS</button>'+
+    '<button class="btn" onclick="closePanel()">ปิด</button></div></div>';
+}
+function closePanel(){ $('#panel').innerHTML=''; }
+function setMethod(v){ PRN.method=v; savePrn(); if(DP.type&&DP.type!==v) DP={dev:null}; openPanel(); renderFab(); notifyPos(); if(v==='usb') autoConnect(); }
+function setPaper(v){ PRN.paper=v; savePrn(); openPanel(); notifyPos(); }
+
+/* ---------------- ลิงก์ระบบ POS ---------------- */
+function posUrl(){
+  var q=new URLSearchParams(location.search).get('pos');
+  if(q){ store('pos_url',q); history.replaceState(null,'',location.pathname+(ALLOW_ANY?'?anyorigin=1':'')); }
+  return store('pos_url')||'';
+}
+function saveUrl(){
+  var v=$('#urlIn').value.trim();
+  if(!/^https:\/\//.test(v)){ toast('ลิงก์ต้องขึ้นต้นด้วย https://','err'); return; }
+  store('pos_url',v); start();
+}
+function changeUrl(){ closePanel(); $('#pos').hidden=true; $('#setup').hidden=false; $('#urlIn').value=store('pos_url')||''; }
+function start(){
+  if($('#envWarn')) $('#envWarn').innerHTML=envWarning();
+  var u=posUrl();
+  if(!u){ $('#setup').hidden=false; $('#pos').hidden=true; return; }
+  $('#setup').hidden=true; $('#pos').hidden=false;
+  if($('#pos').getAttribute('src')!==u) $('#pos').src=u;
+  renderFab(); autoConnect();
+}
+/* จอไม่ดับ (หน้าหลักขอได้) */
+async function keepAwake(){ try{ if('wakeLock' in navigator&&!document.hidden) await navigator.wakeLock.request('screen'); }catch(e){} }
+document.addEventListener('visibilitychange',function(){ if(!document.hidden) keepAwake(); });
+if(navigator.usb){ navigator.usb.addEventListener('disconnect',function(e){ if(DP.dev===e.device){ DP={dev:null}; log('ถอดสาย USB'); renderFab(); notifyPos(); } });
+  navigator.usb.addEventListener('connect',function(){ if(PRN.method==='usb'&&!DP.dev) autoConnect(); }); }
+start(); keepAwake();
+</script>
+</body>
+</html>
